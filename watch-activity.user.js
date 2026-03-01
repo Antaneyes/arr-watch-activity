@@ -144,34 +144,81 @@
     return data?.response?.data ?? null;
   }
 
-  async function findTautulliRatingKey(title, mediaType) {
+  async function findTautulliRatingKeyByGuid(externalId, mediaType) {
+    // Intenta encontrar el rating_key usando el GUID externo (tvdb:// o tmdb://)
+    // Tautulli soporta get_history con guid= que evita problemas de títulos localizados
+    const prefix = mediaType === 'movie' ? 'tmdb' : 'tvdb';
+    const guid = `${prefix}://${externalId}`;
+    const data = await tautulliCmd('get_history', {
+      guid,
+      media_type: mediaType === 'movie' ? 'movie' : 'episode',
+      length: 1,
+    });
+    const rows = data?.data ?? [];
+    if (!rows.length) return null;
+    // El grandparent_rating_key es el de la serie; para películas usar rating_key
+    return mediaType === 'movie'
+      ? rows[0].rating_key
+      : rows[0].grandparent_rating_key;
+  }
+
+  async function findTautulliRatingKeyByTitle(titles, mediaType) {
     const sectionId =
       mediaType === 'movie'
         ? CONFIG.tautulli.movieSectionId
         : CONFIG.tautulli.tvSectionId;
-    const data = await tautulliCmd('get_library_media_info', {
-      section_id: sectionId,
-      search: title,
-      length: 5,
-    });
-    const items = data?.data ?? [];
-    if (!items.length) return null;
-    // Buscar coincidencia exacta primero, luego parcial
-    const exact = items.find(
-      (i) => i.title?.toLowerCase() === title.toLowerCase()
-    );
-    return (exact || items[0])?.rating_key ?? null;
+    for (const title of titles) {
+      if (!title) continue;
+      const data = await tautulliCmd('get_library_media_info', {
+        section_id: sectionId,
+        search: title,
+        length: 5,
+      });
+      const items = data?.data ?? [];
+      if (!items.length) continue;
+      const exact = items.find(
+        (i) => i.title?.toLowerCase() === title.toLowerCase()
+      );
+      const found = exact || items[0];
+      if (found?.rating_key) {
+        console.log(`[WatchActivity] Tautulli: encontrado "${found.title}" buscando por "${title}"`);
+        return found.rating_key;
+      }
+    }
+    return null;
   }
 
-  async function fetchTautulliHistory(title, mediaType) {
+  async function fetchTautulliHistory(mediaInfo, mediaType) {
+    // mediaInfo: { title, originalTitle, alternateTitles, externalId }
     try {
-      const ratingKey = await findTautulliRatingKey(title, mediaType);
+      let ratingKey = null;
+
+      // 1. Intentar por GUID externo (más fiable, evita problemas de localización)
+      if (mediaInfo.externalId) {
+        ratingKey = await findTautulliRatingKeyByGuid(mediaInfo.externalId, mediaType);
+        if (ratingKey) console.log(`[WatchActivity] Tautulli: rating_key ${ratingKey} encontrado por guid`);
+      }
+
+      // 2. Fallback: buscar por título principal, título original y títulos alternativos
+      if (!ratingKey) {
+        const titles = [
+          mediaInfo.title,
+          mediaInfo.originalTitle,
+          ...(mediaInfo.alternateTitles || []),
+        ].filter(Boolean);
+        ratingKey = await findTautulliRatingKeyByTitle(titles, mediaType);
+      }
+
       if (!ratingKey) return [];
 
+      // Para series usar grandparent_rating_key (el rating_key de la serie es el grandparent de los episodios)
+      const historyParams = mediaType === 'movie'
+        ? { rating_key: ratingKey, media_type: 'movie' }
+        : { grandparent_rating_key: ratingKey, media_type: 'episode' };
+
       const data = await tautulliCmd('get_history', {
-        rating_key: ratingKey,
-        media_type: mediaType === 'movie' ? 'movie' : 'episode',
-        length: CONFIG.maxHistory * 3, // pedir más para poder agrupar por usuario
+        ...historyParams,
+        length: CONFIG.maxHistory * 3,
         order_column: 'date',
         order_dir: 'desc',
       });
@@ -493,7 +540,12 @@
     updatePanel({ history: null, requests: null, title });
 
     const [history, requests] = await Promise.all([
-      fetchTautulliHistory(title, 'movie'),
+      fetchTautulliHistory({
+        title: movie.title,
+        originalTitle: movie.originalTitle,
+        alternateTitles: (movie.alternateTitles || []).map((a) => a.title),
+        externalId: movie.tmdbId,
+      }, 'movie'),
       fetchOverseerrRequests(movie.tmdbId, false),
     ]);
 
@@ -520,7 +572,12 @@
     const tvdbId = series.tvdbId;
 
     const [history, requests] = await Promise.all([
-      fetchTautulliHistory(title, 'show'),
+      fetchTautulliHistory({
+        title: series.title,
+        originalTitle: series.originalTitle,
+        alternateTitles: (series.alternateTitles || []).map((a) => a.title),
+        externalId: series.tvdbId,
+      }, 'show'),
       fetchOverseerrRequests(tvdbId, true),
     ]);
 
