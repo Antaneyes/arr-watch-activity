@@ -144,72 +144,100 @@
     return data?.response?.data ?? null;
   }
 
-  async function findTautulliRatingKeyByGuid(externalId, mediaType) {
-    // Intenta encontrar el rating_key usando el GUID externo (tvdb:// o tmdb://)
-    // Tautulli soporta get_history con guid= que evita problemas de títulos localizados
-    const prefix = mediaType === 'movie' ? 'tmdb' : 'tvdb';
-    const guid = `${prefix}://${externalId}`;
-    const data = await tautulliCmd('get_history', {
-      guid,
-      media_type: mediaType === 'movie' ? 'movie' : 'episode',
-      length: 1,
-    });
-    const rows = data?.data ?? [];
-    if (!rows.length) return null;
-    // El grandparent_rating_key es el de la serie; para películas usar rating_key
-    return mediaType === 'movie'
-      ? rows[0].rating_key
-      : rows[0].grandparent_rating_key;
-  }
+  // Cache en memoria para evitar repetir búsquedas de rating_key
+  const ratingKeyCache = {};
 
-  async function findTautulliRatingKeyByTitle(titles, mediaType) {
-    const sectionId =
-      mediaType === 'movie'
-        ? CONFIG.tautulli.movieSectionId
-        : CONFIG.tautulli.tvSectionId;
-    for (const title of titles) {
-      if (!title) continue;
+  async function findTautulliRatingKey(mediaInfo, mediaType) {
+    const cacheKey = `${mediaType}:${mediaInfo.externalId}`;
+    if (ratingKeyCache[cacheKey]) return ratingKeyCache[cacheKey];
+
+    const sectionId = mediaType === 'movie'
+      ? CONFIG.tautulli.movieSectionId
+      : CONFIG.tautulli.tvSectionId;
+
+    const externalPrefix = mediaType === 'movie' ? 'tmdb' : 'tvdb';
+    const externalGuid = `${externalPrefix}://${mediaInfo.externalId}`;
+
+    // Estrategia 1: buscar por título y verificar tvdb/tmdb ID via get_metadata
+    // Obtener candidatos por cada título disponible
+    const titles = [
+      mediaInfo.title,
+      mediaInfo.originalTitle,
+      ...(mediaInfo.alternateTitles || []),
+    ].filter(Boolean);
+
+    // Deduplica títulos
+    const uniqueTitles = [...new Set(titles)];
+
+    for (const title of uniqueTitles) {
       const data = await tautulliCmd('get_library_media_info', {
         section_id: sectionId,
         search: title,
-        length: 5,
+        length: 10,
       });
       const items = data?.data ?? [];
       if (!items.length) continue;
-      const exact = items.find(
-        (i) => i.title?.toLowerCase() === title.toLowerCase()
-      );
-      const found = exact || items[0];
-      if (found?.rating_key) {
-        console.log(`[WatchActivity] Tautulli: encontrado "${found.title}" buscando por "${title}"`);
-        return found.rating_key;
+
+      for (const item of items) {
+        // Verificar que el item tenga el ID externo correcto via get_metadata
+        const meta = await tautulliCmd('get_metadata', { rating_key: item.rating_key });
+        const guids = [
+          ...(meta?.guids ?? []),
+          ...(meta?.grandparent_guids ?? []),
+        ].map((g) => (typeof g === 'string' ? g : g?.id ?? ''));
+
+        if (guids.some((g) => g === externalGuid)) {
+          console.log(`[WatchActivity] Tautulli: "${item.title}" coincide con ${externalGuid}`);
+          ratingKeyCache[cacheKey] = item.rating_key;
+          return item.rating_key;
+        }
       }
     }
+
+    // Estrategia 2: recorrer toda la librería buscando por ID externo
+    // (costoso, solo si las búsquedas por título no dieron resultado)
+    console.log(`[WatchActivity] Tautulli: recorriendo librería completa para ${externalGuid}...`);
+    let start = 0;
+    const pageSize = 100;
+    while (true) {
+      const data = await tautulliCmd('get_library_media_info', {
+        section_id: sectionId,
+        length: pageSize,
+        start,
+      });
+      const items = data?.data ?? [];
+      if (!items.length) break;
+
+      for (const item of items) {
+        const meta = await tautulliCmd('get_metadata', { rating_key: item.rating_key });
+        const guids = [
+          ...(meta?.guids ?? []),
+          ...(meta?.grandparent_guids ?? []),
+        ].map((g) => (typeof g === 'string' ? g : g?.id ?? ''));
+
+        if (guids.some((g) => g === externalGuid)) {
+          console.log(`[WatchActivity] Tautulli: encontrado en búsqueda completa: "${item.title}"`);
+          ratingKeyCache[cacheKey] = item.rating_key;
+          return item.rating_key;
+        }
+      }
+
+      if (items.length < pageSize) break;
+      start += pageSize;
+    }
+
     return null;
   }
 
   async function fetchTautulliHistory(mediaInfo, mediaType) {
     // mediaInfo: { title, originalTitle, alternateTitles, externalId }
     try {
-      let ratingKey = null;
+      const ratingKey = await findTautulliRatingKey(mediaInfo, mediaType);
 
-      // 1. Intentar por GUID externo (más fiable, evita problemas de localización)
-      if (mediaInfo.externalId) {
-        ratingKey = await findTautulliRatingKeyByGuid(mediaInfo.externalId, mediaType);
-        if (ratingKey) console.log(`[WatchActivity] Tautulli: rating_key ${ratingKey} encontrado por guid`);
-      }
-
-      // 2. Fallback: buscar por título principal, título original y títulos alternativos
       if (!ratingKey) {
-        const titles = [
-          mediaInfo.title,
-          mediaInfo.originalTitle,
-          ...(mediaInfo.alternateTitles || []),
-        ].filter(Boolean);
-        ratingKey = await findTautulliRatingKeyByTitle(titles, mediaType);
+        console.warn(`[WatchActivity] Tautulli: no se encontró rating_key para "${mediaInfo.title}"`);
+        return [];
       }
-
-      if (!ratingKey) return [];
 
       // Para series usar grandparent_rating_key (el rating_key de la serie es el grandparent de los episodios)
       const historyParams = mediaType === 'movie'
