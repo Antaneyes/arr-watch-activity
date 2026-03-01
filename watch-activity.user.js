@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Watch Activity - Radarr/Sonarr
 // @namespace    https://github.com/local/watch-activity
-// @version      1.1.0
+// @version      1.2.0
 // @description  Muestra quién ha visto una película/serie (Tautulli) y quién la solicitó (Overseerr) directamente en la UI de Radarr/Sonarr
 // @author       local
 // @match        http://localhost:7878/*
@@ -296,6 +296,42 @@
     }
   }
 
+  // ── Episodios por usuario (Tautulli) ─────────────────────────────────────────
+
+  // Estado de expansión de los dropdowns por usuario { "username": true/false }
+  let expandedUsers = {};
+  // Cache de episodios por usuario { "ratingKey:username": { "1": [1,2,3], "2": [1] } }
+  const episodesCache = {};
+
+  async function fetchUserEpisodes(ratingKey, username) {
+    const cacheKey = `${ratingKey}:${username}`;
+    if (episodesCache[cacheKey]) return episodesCache[cacheKey];
+
+    const data = await tautulliCmd('get_history', {
+      grandparent_rating_key: ratingKey,
+      user: username,
+      media_type: 'episode',
+      length: 500,
+      order_column: 'date',
+      order_dir: 'asc',
+    });
+
+    const bySeason = {};
+    for (const row of data?.data ?? []) {
+      const s = row.parent_media_index ?? '?';
+      const e = row.media_index ?? '?';
+      if (!bySeason[s]) bySeason[s] = new Set();
+      bySeason[s].add(e);
+    }
+    // Convertir Sets a arrays ordenados
+    const result = {};
+    for (const [s, eps] of Object.entries(bySeason)) {
+      result[s] = [...eps].sort((a, b) => Number(a) - Number(b));
+    }
+    episodesCache[cacheKey] = result;
+    return result;
+  }
+
   // ── Render del panel flotante ─────────────────────────────────────────────────
 
   function statusLabel(status) {
@@ -430,11 +466,44 @@
       #${PANEL_ID} .wa-loading { color: #4b5563; font-style: italic; font-size: 12px; }
       #${PANEL_ID} .wa-error   { color: #ef4444; font-size: 12px; }
       #${PANEL_ID} .wa-divider { border: none; border-top: 1px solid #2d3139; margin: 10px 0; }
+      #${PANEL_ID} .wa-tick    { color: #10b981; font-weight: 700; margin-left: 4px; }
+      #${PANEL_ID} .wa-expand-btn {
+        background: none; border: none; cursor: pointer;
+        color: #6b7280; font-size: 10px; padding: 0 4px;
+        line-height: 1; vertical-align: middle;
+      }
+      #${PANEL_ID} .wa-expand-btn:hover { color: #a8b0bc; }
+      #${PANEL_ID} .wa-episodes {
+        padding: 5px 0 3px 8px;
+        border-bottom: 1px solid #22252b;
+      }
+      #${PANEL_ID} .wa-episodes:last-child { border-bottom: none; }
+      #${PANEL_ID} .wa-season {
+        font-size: 11px; color: #6b7280; margin-bottom: 2px;
+      }
+      #${PANEL_ID} .wa-season-label { color: #9ea2a9; font-weight: 600; }
+      #${PANEL_ID} .wa-eps-loading { color: #4b5563; font-style: italic; font-size: 11px; padding: 3px 0; }
     `;
   }
 
-  function buildPanelHtml({ history, requests, title, error, collapsed }) {
+  function buildEpisodesHtml(username, ratingKey) {
+    if (!expandedUsers[username]) return '';
+    const cacheKey = `${ratingKey}:${username}`;
+    const data = episodesCache[cacheKey];
+    if (!data) return `<div class="wa-eps-loading">Cargando episodios...</div>`;
+    if (!Object.keys(data).length) return `<div class="wa-eps-loading">Sin episodios registrados</div>`;
+    return Object.entries(data)
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .map(([season, eps]) =>
+        `<div class="wa-season"><span class="wa-season-label">T${season}:</span> ${eps.map(e => `E${e}`).join(', ')}</div>`
+      ).join('');
+  }
+
+  function buildPanelHtml({ history, requests, title, error, collapsed, isTV, ratingKey }) {
     const colClass = collapsed ? ' collapsed' : '';
+
+    // Set de usuarios que han visto el contenido (para el tick en Overseerr)
+    const watchedUsers = new Set((history || []).map((h) => h.user.toLowerCase().trim()));
 
     let historyHtml = '';
     if (history === null) {
@@ -459,14 +528,26 @@
       requestsHtml = '<div class="wa-empty">No solicitada en Overseerr</div>';
     } else {
       const badgeClass = (s) => ({ 1: 'pending', 2: 'approved', 3: 'declined', 4: 'available', 5: 'approved' }[s] || '');
-      requestsHtml = requests.map((r) => `
-        <div class="wa-row">
-          <span class="wa-user">${escapeHtml(r.requestedBy)}</span>
-          <span class="wa-meta">
-            <span class="wa-badge ${badgeClass(r.status)}">${statusLabel(r.status)}</span>
-            ${r.createdAt ? ` · ${timeAgo(r.createdAt)}` : ''}
-          </span>
-        </div>`).join('');
+      requestsHtml = requests.map((r) => {
+        const hasWatched = watchedUsers.has(r.requestedBy.toLowerCase().trim());
+        const tick = hasWatched ? '<span class="wa-tick">✓</span>' : '';
+        const expanded = !!expandedUsers[r.requestedBy];
+        const expandBtn = (isTV && ratingKey)
+          ? `<button class="wa-expand-btn" data-user="${escapeHtml(r.requestedBy)}" title="Ver episodios">${expanded ? '▼' : '▶'}</button>`
+          : '';
+        const episodesHtml = (isTV && ratingKey && expanded)
+          ? `<div class="wa-episodes">${buildEpisodesHtml(r.requestedBy, ratingKey)}</div>`
+          : '';
+        return `
+          <div class="wa-row">
+            <span class="wa-user">${expandBtn}${escapeHtml(r.requestedBy)}${tick}</span>
+            <span class="wa-meta">
+              <span class="wa-badge ${badgeClass(r.status)}">${statusLabel(r.status)}</span>
+              ${r.createdAt ? ` · ${timeAgo(r.createdAt)}` : ''}
+            </span>
+          </div>
+          ${episodesHtml}`;
+      }).join('');
     }
 
     return `
@@ -510,10 +591,29 @@
       panel = document.createElement('div');
       panel.id = PANEL_ID;
       document.body.appendChild(panel);
-      panel.addEventListener('click', (e) => {
-        if (e.target.id === `${PANEL_ID}-toggle` || e.target.id === `${PANEL_ID}-header` || e.target.closest(`#${PANEL_ID}-header`)) {
+      panel.addEventListener('click', async (e) => {
+        // Toggle colapsar/expandir panel
+        if (e.target.id === `${PANEL_ID}-toggle` || e.target.closest(`#${PANEL_ID}-header`)) {
           panelCollapsed = !panelCollapsed;
           renderToPanel({ _keepData: true });
+          return;
+        }
+        // Toggle dropdown de episodios por usuario
+        const expandBtn = e.target.closest('.wa-expand-btn');
+        if (expandBtn) {
+          const username = expandBtn.dataset.user;
+          const ratingKey = panelData.ratingKey;
+          if (!username || !ratingKey) return;
+          expandedUsers[username] = !expandedUsers[username];
+          renderToPanel({ _keepData: true });
+          // Si se acaba de expandir y no hay datos en caché, cargarlos
+          if (expandedUsers[username]) {
+            const cacheKey = `${ratingKey}:${username}`;
+            if (!episodesCache[cacheKey]) {
+              await fetchUserEpisodes(ratingKey, username);
+              renderToPanel({ _keepData: true });
+            }
+          }
         }
       });
     }
@@ -521,7 +621,7 @@
   }
 
   // Estado actual del panel para re-renderizar al colapsar/expandir
-  let panelData = { history: null, requests: null, title: null, error: null };
+  let panelData = { history: null, requests: null, title: null, error: null, isTV: false, ratingKey: null };
 
   function renderToPanel(data) {
     if (!data._keepData) panelData = { ...panelData, ...data };
@@ -533,7 +633,8 @@
   function removeExistingPanel() {
     const existing = document.getElementById(PANEL_ID);
     if (existing) existing.remove();
-    panelData = { history: null, requests: null, title: null, error: null };
+    panelData = { history: null, requests: null, title: null, error: null, isTV: false, ratingKey: null };
+    expandedUsers = {};
   }
 
   function injectLoading(title) {
@@ -574,7 +675,7 @@
     const displayTitle = tautulliResult.tautulliTitle || title;
     console.log('[WatchActivity] Historial:', tautulliResult.history);
     console.log('[WatchActivity] Solicitudes:', requests);
-    updatePanel({ history: tautulliResult.history, requests, title: displayTitle });
+    updatePanel({ history: tautulliResult.history, requests, title: displayTitle, isTV: false, ratingKey: null });
   }
 
   async function handleSeriesPage(idOrSlug) {
@@ -605,9 +706,13 @@
     ]);
 
     const displayTitle = tautulliResult.tautulliTitle || title;
+    // ratingKey de la serie para el dropdown de episodios por usuario
+    const cacheKey = `show:${series.tvdbId}`;
+    const cachedEntry = ratingKeyCache[cacheKey];
+    const seriesRatingKey = cachedEntry?.ratingKey ?? null;
     console.log('[WatchActivity] Historial:', tautulliResult.history);
     console.log('[WatchActivity] Solicitudes:', requests);
-    updatePanel({ history: tautulliResult.history, requests, title: displayTitle });
+    updatePanel({ history: tautulliResult.history, requests, title: displayTitle, isTV: true, ratingKey: seriesRatingKey });
   }
 
   function onRouteChange(url) {
