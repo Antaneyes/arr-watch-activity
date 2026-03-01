@@ -169,61 +169,52 @@
     // Deduplica títulos
     const uniqueTitles = [...new Set(titles)];
 
+    // Recopilar candidatos de todas las búsquedas por título (sin duplicados)
+    const candidateMap = {};
     for (const title of uniqueTitles) {
       const data = await tautulliCmd('get_library_media_info', {
         section_id: sectionId,
         search: title,
         length: 10,
       });
-      const items = data?.data ?? [];
-      if (!items.length) continue;
-
-      for (const item of items) {
-        // Verificar que el item tenga el ID externo correcto via get_metadata
-        const meta = await tautulliCmd('get_metadata', { rating_key: item.rating_key });
-        const guids = [
-          ...(meta?.guids ?? []),
-          ...(meta?.grandparent_guids ?? []),
-        ].map((g) => (typeof g === 'string' ? g : g?.id ?? ''));
-
-        if (guids.some((g) => g === externalGuid)) {
-          console.log(`[WatchActivity] Tautulli: "${item.title}" coincide con ${externalGuid}`);
-          ratingKeyCache[cacheKey] = item.rating_key;
-          return item.rating_key;
-        }
+      for (const item of data?.data ?? []) {
+        candidateMap[item.rating_key] = item;
       }
     }
 
-    // Estrategia 2: recorrer toda la librería buscando por ID externo
-    // (costoso, solo si las búsquedas por título no dieron resultado)
-    console.log(`[WatchActivity] Tautulli: recorriendo librería completa para ${externalGuid}...`);
-    let start = 0;
-    const pageSize = 100;
-    while (true) {
+    // Si no hubo candidatos por título, coger toda la librería
+    if (!Object.keys(candidateMap).length) {
+      console.log(`[WatchActivity] Tautulli: sin candidatos por título, cargando librería completa...`);
       const data = await tautulliCmd('get_library_media_info', {
         section_id: sectionId,
-        length: pageSize,
-        start,
+        length: 1000,
       });
-      const items = data?.data ?? [];
-      if (!items.length) break;
-
-      for (const item of items) {
-        const meta = await tautulliCmd('get_metadata', { rating_key: item.rating_key });
-        const guids = [
-          ...(meta?.guids ?? []),
-          ...(meta?.grandparent_guids ?? []),
-        ].map((g) => (typeof g === 'string' ? g : g?.id ?? ''));
-
-        if (guids.some((g) => g === externalGuid)) {
-          console.log(`[WatchActivity] Tautulli: encontrado en búsqueda completa: "${item.title}"`);
-          ratingKeyCache[cacheKey] = item.rating_key;
-          return item.rating_key;
-        }
+      for (const item of data?.data ?? []) {
+        candidateMap[item.rating_key] = item;
       }
+    }
 
-      if (items.length < pageSize) break;
-      start += pageSize;
+    // Verificar todos los candidatos en paralelo
+    const candidates = Object.values(candidateMap);
+    const results = await Promise.all(
+      candidates.map((item) =>
+        tautulliCmd('get_metadata', { rating_key: item.rating_key }).then((meta) => {
+          const guids = [
+            ...(meta?.guids ?? []),
+            ...(meta?.grandparent_guids ?? []),
+          ].map((g) => (typeof g === 'string' ? g : g?.id ?? ''));
+          return guids.some((g) => g === externalGuid) ? item.rating_key : null;
+        })
+      )
+    );
+
+    const foundIdx = results.findIndex((r) => r !== null);
+    if (foundIdx !== -1) {
+      const ratingKey = results[foundIdx];
+      const tautulliTitle = candidates[foundIdx].title;
+      console.log(`[WatchActivity] Tautulli: "${tautulliTitle}" (rating_key ${ratingKey}) encontrado para ${externalGuid}`);
+      ratingKeyCache[cacheKey] = { ratingKey, tautulliTitle };
+      return { ratingKey, tautulliTitle };
     }
 
     return null;
@@ -231,13 +222,16 @@
 
   async function fetchTautulliHistory(mediaInfo, mediaType) {
     // mediaInfo: { title, originalTitle, alternateTitles, externalId }
+    // Devuelve { history, tautulliTitle }
     try {
-      const ratingKey = await findTautulliRatingKey(mediaInfo, mediaType);
+      const result = await findTautulliRatingKey(mediaInfo, mediaType);
 
-      if (!ratingKey) {
+      if (!result) {
         console.warn(`[WatchActivity] Tautulli: no se encontró rating_key para "${mediaInfo.title}"`);
-        return [];
+        return { history: [], tautulliTitle: null };
       }
+
+      const { ratingKey, tautulliTitle } = result;
 
       // Para series usar grandparent_rating_key (el rating_key de la serie es el grandparent de los episodios)
       const historyParams = mediaType === 'movie'
@@ -267,9 +261,9 @@
         }
       }
 
-      return Object.values(byUser).slice(0, CONFIG.maxHistory);
+      return { history: Object.values(byUser).slice(0, CONFIG.maxHistory), tautulliTitle };
     } catch {
-      return [];
+      return { history: [], tautulliTitle: null };
     }
   }
 
@@ -567,7 +561,7 @@
     const title = movie.title;
     updatePanel({ history: null, requests: null, title });
 
-    const [history, requests] = await Promise.all([
+    const [tautulliResult, requests] = await Promise.all([
       fetchTautulliHistory({
         title: movie.title,
         originalTitle: movie.originalTitle,
@@ -577,9 +571,10 @@
       fetchOverseerrRequests(movie.tmdbId, false),
     ]);
 
-    console.log('[WatchActivity] Historial:', history);
+    const displayTitle = tautulliResult.tautulliTitle || title;
+    console.log('[WatchActivity] Historial:', tautulliResult.history);
     console.log('[WatchActivity] Solicitudes:', requests);
-    updatePanel({ history, requests, title });
+    updatePanel({ history: tautulliResult.history, requests, title: displayTitle });
   }
 
   async function handleSeriesPage(idOrSlug) {
@@ -599,7 +594,7 @@
 
     const tvdbId = series.tvdbId;
 
-    const [history, requests] = await Promise.all([
+    const [tautulliResult, requests] = await Promise.all([
       fetchTautulliHistory({
         title: series.title,
         originalTitle: series.originalTitle,
@@ -609,9 +604,10 @@
       fetchOverseerrRequests(tvdbId, true),
     ]);
 
-    console.log('[WatchActivity] Historial:', history);
+    const displayTitle = tautulliResult.tautulliTitle || title;
+    console.log('[WatchActivity] Historial:', tautulliResult.history);
     console.log('[WatchActivity] Solicitudes:', requests);
-    updatePanel({ history, requests, title });
+    updatePanel({ history: tautulliResult.history, requests, title: displayTitle });
   }
 
   function onRouteChange(url) {
