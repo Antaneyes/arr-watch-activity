@@ -29,8 +29,8 @@
     tautulli: {
       url: 'http://localhost:8181',
       apiKey: 'TU_TAUTULLI_API_KEY',
-      movieSectionId: 1, // Ve a Tautulli → Settings → Libraries para ver los IDs
-      tvSectionId: 2,
+      // movieSectionId y tvSectionId ya NO son necesarios.
+      // El script detecta automáticamente todas las librerías de Tautulli.
     },
     overseerr: {
       url: 'http://localhost:5055',
@@ -144,77 +144,160 @@
     return data?.response?.data ?? null;
   }
 
-  // Cache en memoria para evitar repetir búsquedas de rating_key
+  // Cache en memoria para evitar repetir búsquedas
   const ratingKeyCache = {};
+  let tautulliSectionsCache = null; // { movie: [sectionId, ...], show: [sectionId, ...] }
+
+  async function getTautulliSections() {
+    if (tautulliSectionsCache) return tautulliSectionsCache;
+    const data = await tautulliCmd('get_libraries_table', { length: 50 });
+    const sections = { movie: [], show: [] };
+    for (const lib of data?.data ?? []) {
+      if (lib.section_type === 'movie') sections.movie.push(String(lib.section_id));
+      else if (lib.section_type === 'show') sections.show.push(String(lib.section_id));
+    }
+    console.log('[WatchActivity] Tautulli secciones detectadas:', sections);
+    tautulliSectionsCache = sections;
+    return sections;
+  }
 
   async function findTautulliRatingKey(mediaInfo, mediaType) {
     const cacheKey = `${mediaType}:${mediaInfo.externalId}`;
     if (ratingKeyCache[cacheKey]) return ratingKeyCache[cacheKey];
 
-    const sectionId = mediaType === 'movie'
-      ? CONFIG.tautulli.movieSectionId
-      : CONFIG.tautulli.tvSectionId;
-
     const externalPrefix = mediaType === 'movie' ? 'tmdb' : 'tvdb';
     const externalGuid = `${externalPrefix}://${mediaInfo.externalId}`;
+    const idStr = String(mediaInfo.externalId);
+    const historyMediaType = mediaType === 'movie' ? 'movie' : 'episode';
 
-    // Estrategia 1: buscar por título y verificar tvdb/tmdb ID via get_metadata
-    // Obtener candidatos por cada título disponible
-    const titles = [
+    const titles = [...new Set([
       mediaInfo.title,
       mediaInfo.originalTitle,
       ...(mediaInfo.alternateTitles || []),
-    ].filter(Boolean);
+    ].filter(Boolean))];
 
-    // Deduplica títulos
-    const uniqueTitles = [...new Set(titles)];
+    function guidMatches(rawGuids) {
+      return rawGuids.some((g) =>
+        g === externalGuid ||
+        g.includes(`themoviedb://${idStr}`) ||
+        g.includes(`thetvdb://${idStr}`) ||
+        new RegExp(`[:/]${idStr}(?:[?#]|$)`).test(g)
+      );
+    }
 
-    // Recopilar candidatos de todas las búsquedas por título (sin duplicados)
-    const candidateMap = {};
-    for (const title of uniqueTitles) {
-      const data = await tautulliCmd('get_library_media_info', {
-        section_id: sectionId,
+    function extractGuids(meta) {
+      return [
+        meta?.guid,
+        ...(meta?.guids ?? []),
+        ...(meta?.grandparent_guids ?? []),
+      ].filter(Boolean).map((g) => (typeof g === 'string' ? g : g?.id ?? ''));
+    }
+
+    // Estrategia 1: buscar en el historial por cada variante de título
+    // (get_history search es lo que usa la UI de Tautulli y no tiene límite de paginación)
+    for (const title of titles) {
+      const data = await tautulliCmd('get_history', {
+        media_type: historyMediaType,
         search: title,
         length: 10,
+        order_column: 'date',
+        order_dir: 'desc',
       });
-      for (const item of data?.data ?? []) {
-        candidateMap[item.rating_key] = item;
+      const rows = data?.data ?? [];
+      if (!rows.length) continue;
+
+      // Agrupar candidatos únicos: para películas usar rating_key, para series grandparent_rating_key
+      const candidates = {};
+      for (const row of rows) {
+        const key = mediaType === 'movie' ? row.rating_key : row.grandparent_rating_key;
+        const title = mediaType === 'movie' ? row.full_title : row.grandparent_title;
+        if (key && !candidates[key]) candidates[key] = { rating_key: key, title };
+      }
+
+      // Verificar guids en paralelo
+      const items = Object.values(candidates);
+      const results = await Promise.all(
+        items.map((item) =>
+          tautulliCmd('get_metadata', { rating_key: item.rating_key }).then((meta) => {
+            const guids = extractGuids(meta);
+            return guidMatches(guids) ? item : null;
+          })
+        )
+      );
+
+      const found = results.find((r) => r !== null);
+      if (found) {
+        console.log(`[WatchActivity] Tautulli: "${found.title}" (${found.rating_key}) encontrado via historial buscando "${title}"`);
+        ratingKeyCache[cacheKey] = { ratingKey: found.rating_key, tautulliTitle: found.title };
+        return ratingKeyCache[cacheKey];
       }
     }
 
-    // Si no hubo candidatos por título, coger toda la librería
-    if (!Object.keys(candidateMap).length) {
-      console.log(`[WatchActivity] Tautulli: sin candidatos por título, cargando librería completa...`);
-      const data = await tautulliCmd('get_library_media_info', {
-        section_id: sectionId,
-        length: 1000,
-      });
-      for (const item of data?.data ?? []) {
-        candidateMap[item.rating_key] = item;
+    // Estrategia 2: get_library_media_info con búsqueda por título en cada variante
+    const sections = await getTautulliSections();
+    const sectionIds = mediaType === 'movie' ? sections.movie : sections.show;
+
+    for (const title of titles) {
+      for (const sectionId of sectionIds) {
+        const searchData = await tautulliCmd('get_library_media_info', {
+          section_id: sectionId,
+          search: title,
+          length: 25,
+        });
+        const items = searchData?.data ?? [];
+        if (!items.length) continue;
+
+        const results = await Promise.all(
+          items.map((item) =>
+            tautulliCmd('get_metadata', { rating_key: item.rating_key }).then((meta) => {
+              const guids = extractGuids(meta);
+              return guidMatches(guids) ? item : null;
+            })
+          )
+        );
+
+        const found = results.find((r) => r !== null);
+        if (found) {
+          console.log(`[WatchActivity] Tautulli: "${found.title}" (${found.rating_key}) encontrado via búsqueda por título "${title}"`);
+          ratingKeyCache[cacheKey] = { ratingKey: found.rating_key, tautulliTitle: found.title };
+          return ratingKeyCache[cacheKey];
+        }
       }
     }
 
-    // Verificar todos los candidatos en paralelo
-    const candidates = Object.values(candidateMap);
-    const results = await Promise.all(
-      candidates.map((item) =>
-        tautulliCmd('get_metadata', { rating_key: item.rating_key }).then((meta) => {
-          const guids = [
-            ...(meta?.guids ?? []),
-            ...(meta?.grandparent_guids ?? []),
-          ].map((g) => (typeof g === 'string' ? g : g?.id ?? ''));
-          return guids.some((g) => g === externalGuid) ? item.rating_key : null;
-        })
-      )
-    );
+    // Estrategia 3: escaneo completo de librería con paginación correcta
+    for (const sectionId of sectionIds) {
+      const probe = await tautulliCmd('get_library_media_info', { section_id: sectionId, length: 1 });
+      const total = probe?.recordsTotal ?? 0;
+      if (!total) continue;
 
-    const foundIdx = results.findIndex((r) => r !== null);
-    if (foundIdx !== -1) {
-      const ratingKey = results[foundIdx];
-      const tautulliTitle = candidates[foundIdx].title;
-      console.log(`[WatchActivity] Tautulli: "${tautulliTitle}" (rating_key ${ratingKey}) encontrado para ${externalGuid}`);
-      ratingKeyCache[cacheKey] = { ratingKey, tautulliTitle };
-      return { ratingKey, tautulliTitle };
+      console.log(`[WatchActivity] Tautulli: escaneando sección ${sectionId} completa (${total} items)...`);
+
+      // Escanear en lotes para no saturar la API
+      const batchSize = 100;
+      for (let start = 0; start < total; start += batchSize) {
+        const batch = await tautulliCmd('get_library_media_info', {
+          section_id: sectionId,
+          length: batchSize,
+          start,
+        });
+        const items = batch?.data ?? [];
+        const results = await Promise.all(
+          items.map((item) =>
+            tautulliCmd('get_metadata', { rating_key: item.rating_key }).then((meta) => {
+              const guids = extractGuids(meta);
+              return guidMatches(guids) ? item : null;
+            })
+          )
+        );
+
+        const found = results.find((r) => r !== null);
+        if (found) {
+          console.log(`[WatchActivity] Tautulli: "${found.title}" (${found.rating_key}) encontrado en sección ${sectionId} (start=${start})`);
+          ratingKeyCache[cacheKey] = { ratingKey: found.rating_key, tautulliTitle: found.title };
+          return ratingKeyCache[cacheKey];
+        }
+      }
     }
 
     return null;
@@ -334,10 +417,6 @@
 
   // ── Render del panel flotante ─────────────────────────────────────────────────
 
-  function statusLabel(status) {
-    const map = { 1: 'Pendiente', 2: 'Aprobada', 3: 'Rechazada', 4: 'Disponible', 5: 'Procesando' };
-    return map[status] ?? `Estado ${status}`;
-  }
 
   function escapeHtml(str) {
     return String(str)
@@ -450,19 +529,6 @@
         font-style: italic;
         font-size: 12px;
       }
-      #${PANEL_ID} .wa-badge {
-        display: inline-block;
-        padding: 1px 6px;
-        border-radius: 8px;
-        font-size: 10px;
-        font-weight: 600;
-        background: #2d3139;
-        color: #9ea2a9;
-      }
-      #${PANEL_ID} .wa-badge.pending  { background: #3b3000; color: #f59e0b; }
-      #${PANEL_ID} .wa-badge.approved { background: #002f1f; color: #10b981; }
-      #${PANEL_ID} .wa-badge.declined { background: #2f0000; color: #ef4444; }
-      #${PANEL_ID} .wa-badge.available{ background: #00231f; color: #34d399; }
       #${PANEL_ID} .wa-loading { color: #4b5563; font-style: italic; font-size: 12px; }
       #${PANEL_ID} .wa-error   { color: #ef4444; font-size: 12px; }
       #${PANEL_ID} .wa-divider { border: none; border-top: 1px solid #2d3139; margin: 10px 0; }
@@ -527,7 +593,6 @@
     } else if (requests.length === 0) {
       requestsHtml = '<div class="wa-empty">No solicitada en Overseerr</div>';
     } else {
-      const badgeClass = (s) => ({ 1: 'pending', 2: 'approved', 3: 'declined', 4: 'available', 5: 'approved' }[s] || '');
       requestsHtml = requests.map((r) => {
         const hasWatched = watchedUsers.has(r.requestedBy.toLowerCase().trim());
         const tick = hasWatched ? '<span class="wa-tick">✓</span>' : '';
@@ -541,10 +606,7 @@
         return `
           <div class="wa-row">
             <span class="wa-user">${expandBtn}${escapeHtml(r.requestedBy)}${tick}</span>
-            <span class="wa-meta">
-              <span class="wa-badge ${badgeClass(r.status)}">${statusLabel(r.status)}</span>
-              ${r.createdAt ? ` · ${timeAgo(r.createdAt)}` : ''}
-            </span>
+            ${r.createdAt ? `<span class="wa-meta">${timeAgo(r.createdAt)}</span>` : ''}
           </div>
           ${episodesHtml}`;
       }).join('');
